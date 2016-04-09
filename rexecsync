@@ -1,0 +1,147 @@
+#!/bin/bash
+# This is rexecsync (https://github.com/tromer/rexecsync),
+# copyright 2004-2016 Eran Tromer <eran@tromer.org>.
+# Distributed under the terms of the GNU General Public License v2 or later;
+# see http://www.gnu.org/licenses/licenses.html for details and (no) warranty.
+
+function help() {
+    cat <<EOF
+
+rexecsync: a script for efficiently saving the output of a remote command into a local file
+
+This script runs a command remotely and saves its output to a local file. The data transfer is done using an rsync-like difference-based, algorithm to reduce communication on subsequent updates.
+
+Usage:
+    rexecsync [-b] [-c] [-v] [-a ...] [-r ...] 'rshell_cmd' 'remote_cmd' file
+where `rshell_cmd` is the prefix command used to execute a remote shell commands,
+`remote_cmd` is the remote command whose output is to be saved (must be a legal bash command with no single quotes), and
+`file` is the local file to be written,
+
+
+Options:
+* -b: create backup of old file with "~" suffix; overwrite if already exists.
+* -c: check whether the exit value of remote_cmd is zero; abort otherwise.
+* -v: verbose output and progress indicators (progress percentage is estimated according to the original file size).
+* -a arg: add arg as command-line arguments to the local rdiff (e.g., "rexecsync -a '--block-size=16384 --sum-size=4' ...").
+* -r cmd: use cmd instead of "$REMOTE_RDIFF" for invoking rdiff on the remote machine (must be a legal bash command with no single-quotes).
+* -d: do a dumb transfer of the whole data, without rdiff (for debugging, or in absence of a remote rdiff).
+
+For example, for a backup of directory on remote host into a local tar.gz file:
+    rexecsync -v 'ssh root@remote.host' 'tar czf - /home/remote-dir/' backup.tar.gz
+
+See https://github.com/tromer/rexecsync for more details and examples.
+EOF
+    exit 2
+}
+
+function die() {
+    echo "$*" >&2
+    echo "Use rexecsync -h for help." >&2
+    exit 1
+}
+
+# We'll want commands inside pipes to send a SIGPIPE to parent if they fail:
+function insist() { { "$@"; } || { echo "# Failed command: $*" >&2; kill -PIPE $$; } }
+
+set -u -e
+
+LOCAL_RDIFF=rdiff
+REMOTE_RDIFF=rdiff
+LOCAL_PV=pv
+RDIFF_PARAM='--block-size=4096 --sum-size=6'
+MAKE_BACKUP=false
+VERBOSE=false
+USE_PV=false
+CHECK_REMOTE=false
+DUMB_XFER=false
+
+# Parse arguments:
+[[ "$*" == '--help' ||  "$*" == '-h' ]] && help
+while getopts "r:a:bvcd" ARG; do
+    case $ARG in 
+        a) RDIFF_PARAM="$OPTARG" ;;
+        r) REMOTE_RDIFF="$OPTARG" ;;
+        b) MAKE_BACKUP=true ;;
+        v) VERBOSE=true;;
+        c) CHECK_REMOTE=true ;;
+        d) DUMB_XFER=true ;;
+        *) die 'Unknown option.' ;;
+    esac
+done
+shift $(( OPTIND - 1 ))
+[[ $# == 3 ]] || die 'Bad arguments.'
+RSHELL_CMD="$1"
+REMOTE_COMMAND="$2"
+LOCAL_FILE="$3"
+LOCAL_BACKUP="${LOCAL_FILE}~"
+LOCAL_TEMP="${LOCAL_FILE}.in_progress"
+if $VERBOSE; then
+    VERBOSE_v=-v; VERBOSE_s=-s;
+    if which $LOCAL_PV >& /dev/null; then
+        USE_PV=true
+    else
+        echo "Missing executable: $LOCAL_PV. Disabling verbose progress indiactor." >&2
+    fi 
+else
+    VERBOSE_v=; VERBOSE_s=;
+fi
+
+# Sanity checks:
+echo -E "$REMOTE_COMMAND $REMOTE_RDIFF" | grep -q \' && die 'Illegal single quote.'
+which "${LOCAL_RDIFF/ *}" >&/dev/null || die "Missing local rdiff executable: $LOCAL_RDIFF  (Do you have the librsync package installed?)"
+for FILE in /dev/std{in,out}; do [[ -e "$FILE" ]] || die "Missing requisite: $FILE"; done
+
+# Cleanup of temporary file in case of failure:
+[[ -f "$LOCAL_TEMP" ]] && { rm $VERBOSE_v -f "$LOCAL_TEMP"; }
+trap 'rm -f $VERBOSE_v "$LOCAL_TEMP"; echo "$0: Failed." >&2; exit 1'  ERR HUP INT QUIT PIPE TERM
+
+# First remove backup, so that max diskspace use is x2 and not x3.
+$MAKE_BACKUP && [[ -f "$LOCAL_BACKUP" ]] && { rm $VERBOSE_v -f "$LOCAL_BACKUP"; }
+
+# Base file for diffs exists?
+if [[ -e "$LOCAL_FILE" ]]; then
+    BASE_FILE="$LOCAL_FILE"
+    BASE_SIZE_ARG="--size `stat --format=%s "$BASE_FILE"`" || die "Cannot stat $BASE_FILE"
+else
+    BASE_FILE=/dev/null
+    BASE_SIZE_ARG=""
+fi
+
+if $DUMB_XFER; then
+  # Do dumb transfer.
+  insist $RSHELL_CMD "$REMOTE_COMMAND" | { $USE_PV && $LOCAL_PV -N "dumb transfer" - || cat; } > "$LOCAL_TEMP"
+else
+  # Do sync using rdiff.
+
+  # This is the full command that will be executed remotely:
+  # Note that spurious 'cat's are needed to "wrap" sockets (for which
+  # /dev/fd/* and /proc/self/fd/* don't work on Linux) into pipes.
+  EXEC_CMD="bash -c ' \
+which \"${REMOTE_RDIFF/ *}\" >&/dev/null || { echo \"# Missing remote rdiff executable: $REMOTE_RDIFF\" >&2; exit 1; } ; \
+{ cat || kill -PIPE \$\$; } | { \
+  { { $REMOTE_COMMAND ; } || ! $CHECK_REMOTE || \
+    { echo \"# Remote command had nonzero exit value!\" >&2; kill -PIPE \$\$ >&/dev/null; } ; \
+  } | $REMOTE_RDIFF delta /dev/fd/15 /dev/stdin /dev/stdout \
+  || kill -PIPE \$\$ >&/dev/null; \
+} 15<&0 | { cat || kill -PIPE \$\$; }'"
+
+  # This pipeline does the real work:
+  $VERBOSE && echo '# Sending hashes...'
+  {
+      {
+          { $USE_PV && insist $LOCAL_PV -N "hashing" "$BASE_FILE" || insist cat "$BASE_FILE"; } \
+          | insist $LOCAL_RDIFF $RDIFF_PARAM signature /dev/stdin /dev/stdout
+          $VERBOSE && echo '# Receiving update...' >&14
+      } \
+      | insist $RSHELL_CMD "$EXEC_CMD" \
+      | insist $LOCAL_RDIFF patch $VERBOSE_s "$BASE_FILE" /dev/stdin /dev/stdout \
+      | { $USE_PV && insist $LOCAL_PV --wait -N "receiving" $BASE_SIZE_ARG - || insist cat; } \
+      > "$LOCAL_TEMP"
+  } 14>&1
+fi
+
+# Rename files:
+$MAKE_BACKUP && [[ -s "$LOCAL_FILE" ]] && mv $VERBOSE_v -f "$LOCAL_FILE" "$LOCAL_BACKUP"
+mv $VERBOSE_v -f "$LOCAL_TEMP" "$LOCAL_FILE"
+
+$VERBOSE && { echo '# Done.'; ls -l "$LOCAL_FILE"; $MAKE_BACKUP && [[ -f "$LOCAL_BACKUP" ]] && ls -l "$LOCAL_BACKUP"; }
